@@ -18,8 +18,16 @@ from ..constants import (
     VERSION_MAP,
 )
 from .clients.divingfish.client import DivingFishAPI
+from .clients.divingfish.exceptions import (
+    DivingFishBindingMismatchError,
+    DivingFishNotAuthorizedError,
+)
 from .clients.divingfish.models import DeviceAuthorization
-from .clients.divingfish.oauth import DivingFishOAuth
+from .clients.divingfish.oauth import (
+    DivingFishOAuth,
+    get_access_token,
+    token_subject,
+)
 from .clients.exceptions import MusicNotPlayError, NotMusicRecommendationError
 from .clients.lxns.client import LxnsAPI, OAuth2
 from .clients.lxns.models import BaseToken, OAuth2Token, SongType
@@ -132,6 +140,36 @@ async def bind_divingfish(qqid: int) -> DeviceAuthorization:
         `DeviceAuthorization`
     """
     return await DivingFishOAuth().device_authorization(qqid)
+
+
+async def complete_divingfish_binding(qqid: int, code: str) -> None:
+    """
+    用用户发回来的确认码完成水鱼绑定，并核对这次绑定确实落在这个 QQ 上
+
+    「发起绑定的人」和「把码发回来的人」是不是同一个，由三道检查合起来保证：
+
+    1. `pending_binding` 的会话——码必须由发起绑定的那个 QQ 发回来，
+       别人发的连这一步都进不来；
+    2. 兑换时把这个 QQ 的标识一并送给水鱼，由它比对发起绑定时提交的那个。
+       这道是权威的，且对不上时不会消费掉那串码；
+    3. 兑换之后再用这个 QQ 换一次票，比对账号是不是同一个。
+
+    第 3 道是兜底：水鱼若还是没有第 2 道校验的版本，它就是唯一的一道。
+    换不到票，说明这个 QQ 根本没完成过授权；换到了但账号对不上，说明这个
+    QQ 早先绑过，而这次的码属于另一个人。
+
+    Params:
+        `qqid`: 用户QQ
+        `code`: 用户发回来的确认码
+    """
+    redeemed = await DivingFishOAuth().redeem(qqid, code)
+    try:
+        access_token = await get_access_token(qqid, refresh=True)
+    except DivingFishNotAuthorizedError as error:
+        raise DivingFishBindingMismatchError from error
+
+    if redeemed.sub and token_subject(access_token) != redeemed.sub:
+        raise DivingFishBindingMismatchError
 
 
 async def get_best50(
