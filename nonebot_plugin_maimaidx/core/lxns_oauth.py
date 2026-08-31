@@ -1,6 +1,4 @@
 import re
-from collections.abc import Callable
-from time import monotonic
 from urllib.parse import parse_qs, urlencode, urlparse
 
 AUTHORIZATION_CODE_PATTERN = re.compile(
@@ -43,40 +41,3 @@ def extract_authorization_code(text: str) -> str | None:
             return code
 
     return None
-
-
-class PendingBindingStore:
-    def __init__(
-        self,
-        ttl: float = 10 * 60,
-        *,
-        clock: Callable[[], float] = monotonic,
-    ) -> None:
-        self.ttl = ttl
-        self._clock = clock
-        self._expires_at: dict[tuple[int, int], float] = {}
-
-    def start(self, self_id: int, user_id: int) -> None:
-        now = self._clock()
-        self._clear_expired(now)
-        self._expires_at[(self_id, user_id)] = now + self.ttl
-
-    def is_active(self, self_id: int, user_id: int) -> bool:
-        now = self._clock()
-        self._clear_expired(now)
-        return (self_id, user_id) in self._expires_at
-
-    def consume(self, self_id: int, user_id: int) -> bool:
-        now = self._clock()
-        self._clear_expired(now)
-        return self._expires_at.pop((self_id, user_id), None) is not None
-
-    def discard(self, self_id: int, user_id: int) -> None:
-        self._expires_at.pop((self_id, user_id), None)
-
-    def _clear_expired(self, now: float) -> None:
-        expired = [
-            key for key, expires_at in self._expires_at.items() if expires_at <= now
-        ]
-        for key in expired:
-            del self._expires_at[key]

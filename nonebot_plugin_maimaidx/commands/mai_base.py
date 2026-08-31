@@ -21,12 +21,18 @@ from sqlalchemy.exc import SQLAlchemyError
 from ..config import dfconfig, log, lxnsconfig, maiconfig
 from ..constants import FORTUNE, LEVEL_LIST
 from ..core.clients.divingfish.client import DivingFishAPI
+from ..core.clients.divingfish.exceptions import (
+    DivingFishBindingMismatchError,
+    DivingFishConfirmationCodeError,
+)
 from ..core.clients.divingfish.oauth import REVOKE_URL, binding_label
 from ..core.clients.exceptions import HTTPError, UnknownError
 from ..core.database.qq import User, update_user
+from ..core.divingfish_oauth import extract_confirmation_code
 from ..core.handler import (
     bind_divingfish,
     bind_lxns,
+    complete_divingfish_binding,
     draw_chart_info,
     draw_rating_ranking,
     draw_rise_score_list,
@@ -34,11 +40,11 @@ from ..core.handler import (
 )
 from ..core.image.tools import image_to_base64, song_chart
 from ..core.lxns_oauth import (
-    PendingBindingStore,
     build_authorize_url,
     extract_authorization_code,
     is_binding_channel_allowed,
 )
+from ..core.pending_binding import PendingBindingStore
 from ..core.merge.models import ServiceName, Theme
 from ..core.service import mai
 from ..core.tool import qqhash
@@ -79,8 +85,28 @@ DIVINGFISH_AUTHORIZE_MSG = dedent("""
     {url}
     =======================
     2. 确认页面显示的绑定身份为「{label}」后点击「同意授权」
+    3. 复制页面给出的确认码，回到 QQ 发送给 BOT
 
-    链接 {minutes} 分钟内有效，授权完成后直接使用查询指令即可，无需回复授权码。
+    本次绑定 {minutes} 分钟内有效，确认码只能使用一次；
+    超时或失效后请重新发送「绑定水鱼」。
+    =======================
+    请注意！！链接与确认码都仅供您本人使用，请勿转发他人。
+    确认码建议在与 BOT 的私聊中发送，避免被他人看到。
+    如需取消授权，请前往 {revoke}
+""").strip()
+#: 水鱼那侧还不认 handoff=code 时用的说明（旧版本会忽略这个参数）。
+#: 那种情况下页面不发确认码，但绑定本身照常成立：用户点完同意，
+#: 映射就建好了，下一条查询指令自然会成功
+DIVINGFISH_AUTHORIZE_LEGACY_MSG = dedent("""
+    请完成水鱼查分器授权：
+
+    1. 打开以下链接并登录水鱼账号，授权「{bot_name} BOT」访问您的水鱼查分器数据
+    =======================
+    {url}
+    =======================
+    2. 确认页面显示的绑定身份为「{label}」后点击「同意授权」
+
+    链接 {minutes} 分钟内有效，授权完成后直接使用查询指令即可，无需回复确认码。
     =======================
     请注意！！这条链接仅供您本人使用，请勿转发他人。
     如需取消授权，请前往 {revoke}
@@ -88,6 +114,33 @@ DIVINGFISH_AUTHORIZE_MSG = dedent("""
 DIVINGFISH_OAUTH_ERROR = "BOT管理员尚未配置水鱼查分器 OAuth 应用，无法进行绑定授权。"
 DIVINGFISH_BIND_FAILED_MSG = (
     "发起水鱼授权失败：水鱼账号服务可能暂时不可用，请稍后再试。"
+)
+DIVINGFISH_NO_SESSION_MSG = (
+    "请先发送「绑定水鱼」获取授权链接，完成授权后再发送确认码。"
+)
+DIVINGFISH_INVALID_CODE_MSG = (
+    "未识别到有效的水鱼确认码。\n"
+    "请发送授权完成页面显示的完整确认码，形如 BCDF-GHJK-LMNP。"
+)
+DIVINGFISH_CODE_FAILED_MSG = (
+    "水鱼绑定失败：确认码可能已使用、已过期，或不是本次绑定的确认码。\n"
+    "当前绑定会话仍有效，您可以发送新的确认码；"
+    "如需重新授权，请再次发送「绑定水鱼」。"
+)
+DIVINGFISH_MISMATCH_MSG = (
+    "水鱼绑定失败：这串确认码对应的授权不属于您的账号。\n"
+    "确认码只能由发起绑定的本人使用，请勿使用他人转发给您的确认码。\n"
+    "如需绑定自己的账号，请发送「绑定水鱼」重新走一遍授权。"
+)
+DIVINGFISH_BIND_SUCCESS_MSG = "水鱼查分器授权完成，现在可以直接使用查询指令了。"
+#: 水鱼的绑定会话要盖住两段窗口：授权链接的 10 分钟，加上用户点完同意之后
+#: 确认码自己的 10 分钟。只按前一段算的话，拖到最后一刻才点同意的人，
+#: 拿着一串仍然有效的码发回来会石沉大海——匹配器不认，BOT 一声不吭
+DIVINGFISH_SESSION_TTL = 20 * 60
+DIVINGFISH_CODE_TEMPORARY_FAILED_MSG = (
+    "水鱼绑定暂时失败：水鱼账号服务或网络出现异常。\n"
+    "当前绑定会话仍有效，您可以稍后重新发送确认码；"
+    "如果确认码已经使用，请再次发送「绑定水鱼」重新授权。"
 )
 LXNS_ERROR = "BOT管理员尚未配置落雪查分器相关信息"
 GROUP_BIND_GUIDE = (
@@ -120,9 +173,24 @@ async def is_pending_authorization_code(
         is_private=isinstance(event, PrivateMessageEvent),
     ):
         return False
-    return pending_bindings.is_active(event.self_id, event.user_id) and bool(
-        extract_authorization_code(event.get_plaintext())
-    )
+    return pending_bindings.is_active(
+        event.self_id, event.user_id, ServiceName.LXNS
+    ) and bool(extract_authorization_code(event.get_plaintext()))
+
+
+async def is_pending_confirmation_code(
+    event: GroupMessageEvent | PrivateMessageEvent,
+) -> bool:
+    """这条消息是不是「发起水鱼绑定的那个人」发回来的确认码
+
+    两个条件缺一不可：这个 QQ 此刻确实在等水鱼的码（会话按
+    `(self_id, user_id)` 记，别人发的落不到这条记录上），且整条消息
+    就是一串确认码。剩下那一半核对在
+    `handler.complete_divingfish_binding` 里向水鱼求证。
+    """
+    return pending_bindings.is_active(
+        event.self_id, event.user_id, ServiceName.DIVINGFISH
+    ) and bool(extract_confirmation_code(event.get_plaintext()))
 
 
 async def complete_lxns_binding(user: User, code: str) -> tuple[str, bool]:
@@ -145,6 +213,12 @@ df_bind = on_command("dfbind", aliases={"绑定水鱼", "绑定df"}, block=True)
 bind_code = on_message(
     rule=is_type(GroupMessageEvent, PrivateMessageEvent)
     & Rule(is_pending_authorization_code),
+    priority=0,
+    block=True,
+)
+df_bind_code = on_message(
+    rule=is_type(GroupMessageEvent, PrivateMessageEvent)
+    & Rule(is_pending_confirmation_code),
     priority=0,
     block=True,
 )
@@ -209,7 +283,7 @@ async def _(
 
     text = message.extract_plain_text().strip()
     if not text:
-        pending_bindings.start(event.self_id, event.user_id)
+        pending_bindings.start(event.self_id, event.user_id, ServiceName.LXNS)
         channel_guide = (
             "请在当前私聊发送授权码或完整回调链接。"
             if is_private
@@ -228,7 +302,7 @@ async def _(
     if succeeded:
         pending_bindings.discard(event.self_id, event.user_id)
     else:
-        pending_bindings.start(event.self_id, event.user_id)
+        pending_bindings.start(event.self_id, event.user_id, ServiceName.LXNS)
     await bind.finish(result, reply_message=True)
 
 
@@ -238,7 +312,9 @@ async def _(
     user: User = Depends(GetOrCreateSender),
 ):
     code = extract_authorization_code(event.get_plaintext())
-    if code is None or not pending_bindings.is_active(event.self_id, event.user_id):
+    if code is None or not pending_bindings.is_active(
+        event.self_id, event.user_id, ServiceName.LXNS
+    ):
         return
     result, succeeded = await complete_lxns_binding(user, code)
     if succeeded:
@@ -246,10 +322,47 @@ async def _(
     await bind_code.finish(result, reply_message=True)
 
 
+async def complete_divingfish(qqid: int, code: str) -> tuple[str, bool]:
+    try:
+        await complete_divingfish_binding(qqid, code)
+    except DivingFishBindingMismatchError:
+        # 码有效，但兑出来的授权不是这个 QQ 的。多半是把别人转发来的码
+        # 当成自己的用了——照实说清楚，别让他以为是自己操作错了
+        log.warning("水鱼确认码与发起绑定的用户不一致")
+        return DIVINGFISH_MISMATCH_MSG, False
+    except DivingFishConfirmationCodeError:
+        return DIVINGFISH_CODE_FAILED_MSG, False
+    except (HTTPError, HTTPXError, UnknownError, ValidationError) as error:
+        log.warning(f"水鱼绑定暂时失败：{type(error).__name__}")
+        return DIVINGFISH_CODE_TEMPORARY_FAILED_MSG, False
+    return DIVINGFISH_BIND_SUCCESS_MSG, True
+
+
 @df_bind.handle()
-async def _(user: User = Depends(GetOrCreateSender)):
+async def _(
+    event: GroupMessageEvent | PrivateMessageEvent,
+    message: Message = CommandArg(),
+    user: User = Depends(GetOrCreateSender),
+):
     if not dfconfig.oauth_enabled:
         await df_bind.finish(DIVINGFISH_OAUTH_ERROR, reply_message=True)
+
+    # 「绑定水鱼 BCDF-GHJK-LMNP」：把码直接跟在指令后面
+    text = message.extract_plain_text().strip()
+    if text:
+        if not pending_bindings.is_active(
+            event.self_id, event.user_id, ServiceName.DIVINGFISH
+        ):
+            # 没发起过就送来一串码，只能是别处转发来的。这时候不该去兑换：
+            # 兑换会烧掉那串码，而它本来是另一个人的
+            await df_bind.finish(DIVINGFISH_NO_SESSION_MSG, reply_message=True)
+        code = extract_confirmation_code(text)
+        if code is None:
+            await df_bind.finish(DIVINGFISH_INVALID_CODE_MSG, reply_message=True)
+        result, succeeded = await complete_divingfish(user.qqid, code)
+        if succeeded:
+            pending_bindings.consume(event.self_id, event.user_id)
+        await df_bind.finish(result, reply_message=True)
 
     try:
         authorization = await bind_divingfish(user.qqid)
@@ -257,6 +370,28 @@ async def _(user: User = Depends(GetOrCreateSender)):
         log.warning(f"水鱼授权发起失败：{type(error).__name__}")
         await df_bind.finish(DIVINGFISH_BIND_FAILED_MSG, reply_message=True)
 
+    if authorization.handoff != "code":
+        # 水鱼那侧没按确认码受理（还没上这条路），页面不会发码。等下去等不到，
+        # 但绑定本身仍然成立，所以退回老流程的说明，也不开等码的会话
+        log.warning("水鱼账号服务未以确认码方式受理本次绑定，退回原流程")
+        await df_bind.finish(
+            DIVINGFISH_AUTHORIZE_LEGACY_MSG.format(
+                bot_name=maiconfig.bot_name,
+                url=authorization.verification_uri_complete,
+                label=binding_label(user.qqid),
+                minutes=max(authorization.expires_in // 60, 1),
+                revoke=dfconfig.divingfish_auth_url.rstrip("/") + REVOKE_URL,
+            ),
+            reply_message=True,
+        )
+
+    # 会话记在这里：此后只有这个 QQ 发回来的码会被受理
+    pending_bindings.start(
+        event.self_id,
+        event.user_id,
+        ServiceName.DIVINGFISH,
+        ttl=DIVINGFISH_SESSION_TTL,
+    )
     await df_bind.finish(
         DIVINGFISH_AUTHORIZE_MSG.format(
             bot_name=maiconfig.bot_name,
@@ -267,6 +402,22 @@ async def _(user: User = Depends(GetOrCreateSender)):
         ),
         reply_message=True,
     )
+
+
+@df_bind_code.handle()
+async def _(
+    event: GroupMessageEvent | PrivateMessageEvent,
+    user: User = Depends(GetOrCreateSender),
+):
+    code = extract_confirmation_code(event.get_plaintext())
+    if code is None or not pending_bindings.is_active(
+        event.self_id, event.user_id, ServiceName.DIVINGFISH
+    ):
+        return
+    result, succeeded = await complete_divingfish(user.qqid, code)
+    if succeeded:
+        pending_bindings.consume(event.self_id, event.user_id)
+    await df_bind_code.finish(result, reply_message=True)
 
 
 @source.handle()

@@ -32,6 +32,9 @@ class DeviceAuthorization(BaseModel):
     verification_uri_complete: str
     expires_in: int
     interval: int = 5
+    #: 收尾方式。请求里带了 `handoff=code` 时水鱼会原样回显，
+    #: 借此确认本次绑定确实要等用户回填确认码
+    handoff: str = "poll"
 
 
 class AccessToken(BaseModel):
@@ -41,3 +44,5 @@ class AccessToken(BaseModel):
     token_type: str
     expires_in: int
     scope: str
+    #: 该用户的水鱼用户 ID。只有兑换确认码的响应里有，换票的响应里没有
+    sub: str | None = None

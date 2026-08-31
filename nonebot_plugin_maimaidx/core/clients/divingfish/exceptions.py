@@ -31,3 +31,11 @@ class DivingFishTooManyRequestsError(HTTPError):
 
 class DivingFishOAuthError(HTTPError):
     """水鱼查分器 OAuth 请求失败"""
+
+
+class DivingFishConfirmationCodeError(HTTPError):
+    """确认码无效、已过期或已被使用"""
+
+
+class DivingFishBindingMismatchError(HTTPError):
+    """兑换出的授权不属于发起本次绑定的那个 QQ"""
