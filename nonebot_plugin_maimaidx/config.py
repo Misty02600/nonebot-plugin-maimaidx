@@ -65,6 +65,10 @@ class LxnsConfig(BaseModel):
     redirect_uri: str | None = None
     lxns_bind_private_only: bool = False
 
+    @property
+    def oauth_redirect_uri(self) -> str:
+        return self.redirect_uri or "urn:ietf:wg:oauth:2.0:oob"
+
 
 maiconfig = get_plugin_config(BaseConfig)
 dfconfig = get_plugin_config(DivingFishConfig)

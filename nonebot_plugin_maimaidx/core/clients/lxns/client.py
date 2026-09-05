@@ -36,7 +36,7 @@ class OAuth2(ApiClient):
         )
         self.client_id = lxnsconfig.lx_client_id
         self.client_secret = lxnsconfig.lx_client_secret
-        self.redirect_uri = lxnsconfig.redirect_uri
+        self.redirect_uri = lxnsconfig.oauth_redirect_uri
         self.token: OAuth2Token | BaseToken | None = None
 
     async def fetch_token(self, code: str) -> OAuth2Token:

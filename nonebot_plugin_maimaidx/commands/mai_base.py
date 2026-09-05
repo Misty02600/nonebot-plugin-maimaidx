@@ -57,7 +57,7 @@ from .depend import (
 )
 
 AUTHORIZE_URL = build_authorize_url(
-    lxnsconfig.lx_client_id or "", lxnsconfig.redirect_uri or ""
+    lxnsconfig.lx_client_id or "", lxnsconfig.oauth_redirect_uri
 )
 AUTHORIZE_MSG = dedent(f"""
     请完成落雪账号绑定：
@@ -272,13 +272,7 @@ async def _(
     ):
         await bind.finish(GROUP_BIND_GUIDE, reply_message=True)
 
-    if not all(
-        (
-            lxnsconfig.lx_client_id,
-            lxnsconfig.lx_client_secret,
-            lxnsconfig.redirect_uri,
-        )
-    ):
+    if not (lxnsconfig.lx_client_id and lxnsconfig.lx_client_secret):
         await bind.finish(LXNS_ERROR + "，无法进行绑定授权。", reply_message=True)
 
     text = message.extract_plain_text().strip()
@@ -431,8 +425,8 @@ async def _(message: Message = CommandArg(), user: User = Depends(GetOrCreateSen
         )
     if (
         source_ == ServiceName.LXNS
-        and lxnsconfig.lxns_dev_token is None
-        and (lxnsconfig.lx_client_id is None or lxnsconfig.redirect_uri is None)
+        and not lxnsconfig.lxns_dev_token
+        and not (lxnsconfig.lx_client_id and lxnsconfig.lx_client_secret)
     ):
         await update_user(user.qqid, service=ServiceName.DIVINGFISH)
         await source.finish(
